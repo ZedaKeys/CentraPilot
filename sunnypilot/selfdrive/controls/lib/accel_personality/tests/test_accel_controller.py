@@ -13,10 +13,15 @@ import pytest
 from openpilot.sunnypilot.selfdrive.controls.lib.accel_personality.accel_controller import AccelController
 from openpilot.sunnypilot.selfdrive.controls.lib.accel_personality.constants import \
   ECO, NORMAL, SPORT, PERSONALITY_MIN, PERSONALITY_MAX, A_CRUISE_MAX_BP, RISE_RATE, \
-  STOCK_A_CRUISE_MAX_V, STOCK_RISE_RATE, HARD_BRAKE_TARGET_ACCEL, AccelerationPersonality
+  STOCK_A_CRUISE_MAX_V, STOCK_RISE_RATE, HARD_BRAKE_TARGET_ACCEL, AccelerationPersonality, \
+  LOWSPEED_COMFORT_CAP, LOWSPEED_CAP_MAX_V_EGO, LOWSPEED_CAP_SAFETY_BUFFER
 
 T_IDXS = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 4.0]
 _EPS = 1e-6
+
+
+def stop_in_gap(v_ego, dRel):
+  return v_ego ** 2 / (2.0 * max(dRel - LOWSPEED_CAP_SAFETY_BUFFER, 0.1))
 
 
 class FakeParams:
@@ -33,8 +38,10 @@ class FakeParams:
     self.store[key] = val
 
 
-def make_sm(v_ego=20.0):
-  return {'carState': SimpleNamespace(vEgo=v_ego)}
+def make_sm(v_ego=20.0, lead=False, dRel=0.0, vRel=0.0, aLeadK=0.0):
+  leadOne = SimpleNamespace(status=lead, dRel=dRel, vRel=vRel, aLeadK=aLeadK)
+  return {'carState': SimpleNamespace(vEgo=v_ego),
+          'radarState': SimpleNamespace(leadOne=leadOne)}
 
 
 def make_controller(enabled=True, personality=NORMAL, crash_cnt=0):
@@ -156,3 +163,81 @@ def test_reset_passes_through():
   out = ctrl.smooth_target_accel(0.0, flat_traj(-1.0), T_IDXS, should_stop=False, reset=True)
   assert out == pytest.approx(0.0, abs=_EPS)
   assert not ctrl.bypassed()
+
+
+# --- low-speed comfort brake cap ---
+
+def test_lowspeed_cap_softens_gap_restoration():
+  # roomy gap, gentle closing, low speed: a firm -1.9 gap-restoration brake softens toward the comfort cap
+  ctrl = make_controller(personality=ECO)
+  ctrl.update(make_sm(v_ego=7.0, lead=True, dRel=25.0, vRel=-4.0, aLeadK=-1.0))
+  raw = -1.9
+  out = ctrl.smooth_target_accel(raw, flat_traj(-0.5), T_IDXS, should_stop=False)
+  assert out == pytest.approx(LOWSPEED_COMFORT_CAP, abs=_EPS)  # floor (-stop_in_gap) is gentler here, so comfort cap binds
+  assert out > raw  # softened
+  assert out <= -stop_in_gap(7.0, 25.0) + _EPS  # never gentler than the stop-in-gap floor
+
+
+def test_lowspeed_cap_floor_overrides_comfort_when_gap_tight():
+  # tight gap: stop-in-gap floor is firmer than the comfort cap -> floor binds, brake not softened to comfort
+  ctrl = make_controller(personality=ECO)
+  ctrl.update(make_sm(v_ego=7.5, lead=True, dRel=11.0, vRel=-3.0, aLeadK=-1.0))
+  raw = -1.9
+  floor = -stop_in_gap(7.5, 11.0)  # ~-2.01, firmer than -1.5
+  out = ctrl.smooth_target_accel(raw, flat_traj(-0.5), T_IDXS, should_stop=False)
+  assert out <= LOWSPEED_COMFORT_CAP + _EPS  # not softened to the comfort cap
+  assert out <= floor + 1e-3 or out == pytest.approx(raw, abs=_EPS)  # never gentler than the floor
+
+
+def test_lowspeed_cap_floor_invariant_sweep():
+  # the safety invariant: capped output is never gentler than max(raw, -stop_in_gap)
+  rng = np.random.default_rng(1)
+  ctrl = make_controller(personality=ECO)
+  for _ in range(2000):
+    v = float(rng.uniform(1.0, 8.4))
+    d = float(rng.uniform(5.0, 40.0))
+    vr = float(rng.uniform(-5.9, 0.0))
+    al = float(rng.uniform(-2.4, 0.0))
+    ctrl.update(make_sm(v_ego=v, lead=True, dRel=d, vRel=vr, aLeadK=al))
+    raw = float(rng.uniform(-1.99, -1.51))  # firm band that can be capped
+    out = ctrl.smooth_target_accel(raw, flat_traj(raw + 0.5), T_IDXS, should_stop=False)
+    floor = -stop_in_gap(v, d)
+    # safety invariant: output is never gentler than the stop-in-gap floor (unless the plan itself is gentler)
+    assert out <= max(raw, floor) + 1e-6
+
+
+def test_lowspeed_cap_gated_off_high_speed():
+  ctrl = make_controller(personality=ECO)
+  ctrl.update(make_sm(v_ego=LOWSPEED_CAP_MAX_V_EGO + 1.0, lead=True, dRel=25.0, vRel=-4.0, aLeadK=-1.0))
+  out = ctrl.smooth_target_accel(-1.9, flat_traj(-1.9), T_IDXS, should_stop=False)
+  assert out == pytest.approx(-1.9, abs=_EPS)  # no cap above the speed gate
+
+
+def test_lowspeed_cap_gated_off_hard_lead():
+  ctrl = make_controller(personality=ECO)
+  ctrl.update(make_sm(v_ego=7.0, lead=True, dRel=20.0, vRel=-4.0, aLeadK=-3.2))  # lead braking hard
+  out = ctrl.smooth_target_accel(-1.9, flat_traj(-1.9), T_IDXS, should_stop=False)
+  assert out == pytest.approx(-1.9, abs=_EPS)  # hard-braking lead -> no softening, full brake
+
+
+def test_lowspeed_cap_gated_off_no_lead():
+  ctrl = make_controller(personality=ECO)
+  ctrl.update(make_sm(v_ego=7.0, lead=False))  # no radar lead (e.g. vision/cruise decel)
+  out = ctrl.smooth_target_accel(-1.9, flat_traj(-1.9), T_IDXS, should_stop=False)
+  assert out == pytest.approx(-1.9, abs=_EPS)
+
+
+def test_lowspeed_cap_does_not_touch_emergency():
+  # raw <= -2.0 hits _emergency_bypass before the cap; never softened
+  ctrl = make_controller(personality=ECO)
+  ctrl.update(make_sm(v_ego=7.0, lead=True, dRel=25.0, vRel=-4.0, aLeadK=-1.0))
+  out = ctrl.smooth_target_accel(-2.4, flat_traj(-2.4), T_IDXS, should_stop=False)
+  assert out == pytest.approx(-2.4, abs=_EPS)
+  assert ctrl.bypassed()
+
+
+def test_lowspeed_cap_off_when_disabled():
+  ctrl = make_controller(enabled=False)
+  ctrl.update(make_sm(v_ego=7.0, lead=True, dRel=25.0, vRel=-4.0, aLeadK=-1.0))
+  out = ctrl.smooth_target_accel(-1.9, flat_traj(-1.9), T_IDXS, should_stop=False)
+  assert out == pytest.approx(-1.9, abs=_EPS)  # off == stock

@@ -41,3 +41,14 @@ SMOOTH_DECEL_LOOKAHEAD_T = 3.0
 MIN_SMOOTH_BRAKE_NEED = 0.3
 HARD_BRAKE_TARGET_ACCEL = -2.0
 HARD_BRAKE_NEED = 2.6
+
+# Low-speed comfort brake cap. Firm low-speed brakes (-1.5..-2.0) are mostly the MPC restoring
+# follow-gap, not collision-avoidance. In a tightly-gated low-speed-following regime, soften the
+# brake toward LOWSPEED_COMFORT_CAP -- but never gentler than the decel needed to stop within the
+# current gap if the lead dead-stops (the stop-in-gap physics floor). Gated behind enabled (off==stock).
+LOWSPEED_COMFORT_CAP = -1.5       # comfort target (m/s^2); the floor overrides it whenever the gap is tight
+LOWSPEED_CAP_MAX_V_EGO = 8.5      # only below this speed (firm events sit at 7.9-8.1)
+LOWSPEED_CAP_MIN_TTC = 4.0        # only when not genuinely closing
+LOWSPEED_CAP_MIN_VREL = -6.0      # release if closing faster than this
+LOWSPEED_CAP_MIN_ALEAD = -2.5     # release if the lead is braking harder than this
+LOWSPEED_CAP_SAFETY_BUFFER = 4.0  # meters held in reserve for the stop-in-gap floor

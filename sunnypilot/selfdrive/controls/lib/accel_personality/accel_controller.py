@@ -17,7 +17,9 @@ from openpilot.sunnypilot import get_sanitize_int_param
 from openpilot.sunnypilot.selfdrive.controls.lib.accel_personality.constants import \
   NORMAL, PERSONALITY_MIN, PERSONALITY_MAX, A_CRUISE_MAX_BP, A_CRUISE_MAX_V, RISE_RATE, SMOOTH_DECEL_BP, \
   SMOOTH_DECEL_V, BRAKE_DEEPENING_JERK, BRAKE_RELEASE_JERK, ACCEL_RISE_JERK, SMOOTH_DECEL_LOOKAHEAD_T, \
-  MIN_SMOOTH_BRAKE_NEED, HARD_BRAKE_TARGET_ACCEL, HARD_BRAKE_NEED
+  MIN_SMOOTH_BRAKE_NEED, HARD_BRAKE_TARGET_ACCEL, HARD_BRAKE_NEED, \
+  LOWSPEED_COMFORT_CAP, LOWSPEED_CAP_MAX_V_EGO, LOWSPEED_CAP_MIN_TTC, LOWSPEED_CAP_MIN_VREL, \
+  LOWSPEED_CAP_MIN_ALEAD, LOWSPEED_CAP_SAFETY_BUFFER
 
 _ZERO_ACCEL_EPS = 1e-6
 
@@ -36,6 +38,10 @@ class AccelController:
     self._decel_target = 0.0
     self._smooth_active = False
     self._bypassed = False
+    self._lead_valid = False
+    self._lead_drel = 0.0
+    self._lead_vrel = 0.0
+    self._lead_alead = 0.0
     self._read_params()
 
   def _read_params(self) -> None:
@@ -49,6 +55,11 @@ class AccelController:
     if self._frame % int(1. / DT_MDL) == 0:
       self._read_params()
     self._v_ego = sm['carState'].vEgo
+    lead = sm['radarState'].leadOne
+    self._lead_valid = bool(lead.status)
+    self._lead_drel = float(lead.dRel)
+    self._lead_vrel = float(lead.vRel)
+    self._lead_alead = float(lead.aLeadK)
     self._frame += 1
 
   def get_max_accel(self, v_ego: float) -> float:
@@ -78,13 +89,36 @@ class AccelController:
     if self._brake_need < MIN_SMOOTH_BRAKE_NEED:
       self._smooth_active = False
       slewed = self._slew(raw_target_accel)
-      return self._finalize(min(slewed, raw_target_accel) if raw_target_accel < 0.0 else slewed)
+      out = min(slewed, raw_target_accel) if raw_target_accel < 0.0 else slewed
+      return self._finalize(self._apply_lowspeed_cap(out, raw_target_accel, should_stop))
 
     # front-load a gentle early brake, never weaker than the plan
     self._smooth_active = True
     self._decel_target = self.get_decel_target(self._brake_need)
     slewed = self._slew(min(raw_target_accel, self._decel_target))
-    return self._finalize(min(slewed, raw_target_accel))
+    out = min(slewed, raw_target_accel)
+    return self._finalize(self._apply_lowspeed_cap(out, raw_target_accel, should_stop))
+
+  def _apply_lowspeed_cap(self, out: float, raw_target_accel: float, should_stop: bool) -> float:
+    # Soften a firm low-speed gap-restoration brake toward the comfort cap, but never gentler than the
+    # decel needed to stop within the current gap if the lead dead-stops. Hard on/off gates, recomputed
+    # every frame from live lead state -> instant release (no stale soft value). Only ever softens.
+    if (not self._enabled or should_stop or not self._lead_valid
+        or self._v_ego >= LOWSPEED_CAP_MAX_V_EGO
+        or self._lead_vrel <= LOWSPEED_CAP_MIN_VREL
+        or self._lead_alead <= LOWSPEED_CAP_MIN_ALEAD):
+      return out
+    # only the firm-but-not-emergency band (deeper brakes already passed through _emergency_bypass)
+    if not (HARD_BRAKE_TARGET_ACCEL < raw_target_accel < LOWSPEED_COMFORT_CAP):
+      return out
+    closing = -self._lead_vrel
+    ttc = self._lead_drel / closing if closing > _ZERO_ACCEL_EPS else float('inf')
+    if ttc <= LOWSPEED_CAP_MIN_TTC:
+      return out
+    # stop-in-gap physics floor: ego decel to halt within (gap - buffer), worst case lead dead-stops
+    stop_in_gap = self._v_ego ** 2 / (2.0 * max(self._lead_drel - LOWSPEED_CAP_SAFETY_BUFFER, 0.1))
+    capped = max(raw_target_accel, min(LOWSPEED_COMFORT_CAP, -stop_in_gap))
+    return max(out, capped)
 
   def _compute_brake_need(self, raw_target_accel: float, accel_trajectory: Sequence[float], t_idxs: Sequence[float]) -> float:
     min_accel = float(raw_target_accel)
