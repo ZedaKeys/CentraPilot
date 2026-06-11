@@ -52,3 +52,17 @@ LOWSPEED_CAP_MIN_TTC = 4.0        # only when not genuinely closing
 LOWSPEED_CAP_MIN_VREL = -6.0      # release if closing faster than this
 LOWSPEED_CAP_MIN_ALEAD = -2.5     # release if the lead is braking harder than this
 LOWSPEED_CAP_SAFETY_BUFFER = 4.0  # meters held in reserve for the stop-in-gap floor
+
+# Lead launch boost. When a lead genuinely pulls away (accelerating) at low speed, the eco accel ceiling
+# pins ego below the lead's takeoff. Temporarily un-gentle eco TOWARD stock-NORMAL (ceiling + ceiling-slew +
+# onset jerk), scaled by how fast the lead is pulling away and faded out as ego catches up (vRel->0) so it
+# can never overshoot lead speed into a brake. Gated behind enabled + non-NORMAL personality (off==stock).
+# Every raise is capped at the stock-NORMAL value: at full boost eco launches like NORMAL, never beyond.
+LAUNCH_MAX_V_EGO = 8.0        # only below this speed (launch/low-speed regime)
+LAUNCH_VREL_ON = 1.0          # m/s, lead must be opening at least this much (arm + decay floor)
+LAUNCH_VREL_FULL = 3.0        # m/s, full boost at/above this opening rate
+LAUNCH_ALEAD_ON = 0.3         # m/s^2, lead must actually be accelerating
+LAUNCH_SUSTAIN_FRAMES = 4     # ~0.2s sustain to reject radar blips / lead-switch spikes
+LAUNCH_CEIL_FRAC = 1.0        # fraction of the eco->normal ceiling gap to grant at full boost
+LAUNCH_B_SLEW_UP = 0.04       # boost factor rise per frame (~0.5s to full)
+LAUNCH_B_SLEW_DN = 0.10       # boost factor fall per frame (faster fade than rise)

@@ -17,9 +17,11 @@ from openpilot.sunnypilot import get_sanitize_int_param
 from openpilot.sunnypilot.selfdrive.controls.lib.accel_personality.constants import \
   NORMAL, PERSONALITY_MIN, PERSONALITY_MAX, A_CRUISE_MAX_BP, A_CRUISE_MAX_V, RISE_RATE, SMOOTH_DECEL_BP, \
   SMOOTH_DECEL_V, BRAKE_DEEPENING_JERK, BRAKE_RELEASE_JERK, ACCEL_RISE_JERK, SMOOTH_DECEL_LOOKAHEAD_T, \
-  MIN_SMOOTH_BRAKE_NEED, HARD_BRAKE_TARGET_ACCEL, HARD_BRAKE_NEED, \
+  MIN_SMOOTH_BRAKE_NEED, HARD_BRAKE_TARGET_ACCEL, HARD_BRAKE_NEED, STOCK_A_CRUISE_MAX_V, STOCK_RISE_RATE, \
   LOWSPEED_COMFORT_CAP, LOWSPEED_CAP_MAX_V_EGO, LOWSPEED_CAP_MIN_TTC, LOWSPEED_CAP_MIN_VREL, \
-  LOWSPEED_CAP_MIN_ALEAD, LOWSPEED_CAP_SAFETY_BUFFER
+  LOWSPEED_CAP_MIN_ALEAD, LOWSPEED_CAP_SAFETY_BUFFER, \
+  LAUNCH_MAX_V_EGO, LAUNCH_VREL_ON, LAUNCH_VREL_FULL, LAUNCH_ALEAD_ON, LAUNCH_SUSTAIN_FRAMES, \
+  LAUNCH_CEIL_FRAC, LAUNCH_B_SLEW_UP, LAUNCH_B_SLEW_DN
 
 _ZERO_ACCEL_EPS = 1e-6
 
@@ -42,6 +44,8 @@ class AccelController:
     self._lead_drel = 0.0
     self._lead_vrel = 0.0
     self._lead_alead = 0.0
+    self._launch_arm_cnt = 0
+    self._launch_boost = 0.0
     self._read_params()
 
   def _read_params(self) -> None:
@@ -60,13 +64,40 @@ class AccelController:
     self._lead_drel = float(lead.dRel)
     self._lead_vrel = float(lead.vRel)
     self._lead_alead = float(lead.aLeadK)
+    self._update_launch_boost()
     self._frame += 1
 
+  def _update_launch_boost(self) -> None:
+    # Arm only on a sustained genuine lead pull-away; recompute the vRel-scaled boost factor every frame.
+    if not self._enabled or self._personality == NORMAL:
+      self._launch_arm_cnt = 0
+      self._launch_boost = 0.0
+      return
+    gated = (self._lead_valid and self._v_ego < LAUNCH_MAX_V_EGO
+             and self._lead_vrel >= LAUNCH_VREL_ON and self._lead_alead >= LAUNCH_ALEAD_ON)
+    self._launch_arm_cnt = self._launch_arm_cnt + 1 if gated else 0
+    if self._launch_arm_cnt < LAUNCH_SUSTAIN_FRAMES:
+      target = 0.0
+    else:
+      target = float(np.clip((self._lead_vrel - LAUNCH_VREL_ON) / (LAUNCH_VREL_FULL - LAUNCH_VREL_ON), 0.0, 1.0))
+    # slew the factor: rise rate-limited, faster fade-out (decay leads the catch-up so ego can't overshoot)
+    self._launch_boost = float(np.clip(target, self._launch_boost - LAUNCH_B_SLEW_DN, self._launch_boost + LAUNCH_B_SLEW_UP))
+
+  def _rise_jerk(self) -> float:
+    # positive-accel onset jerk, lifted toward NORMAL by the launch boost (capped at NORMAL, never beyond)
+    base = ACCEL_RISE_JERK[self._personality]
+    return base + self._launch_boost * max(0.0, ACCEL_RISE_JERK[NORMAL] - base)
+
   def get_max_accel(self, v_ego: float) -> float:
-    return float(np.interp(v_ego, A_CRUISE_MAX_BP, A_CRUISE_MAX_V[self._personality]))
+    base = float(np.interp(v_ego, A_CRUISE_MAX_BP, A_CRUISE_MAX_V[self._personality]))
+    if self._launch_boost <= 0.0:
+      return base
+    norm = float(np.interp(v_ego, A_CRUISE_MAX_BP, STOCK_A_CRUISE_MAX_V))
+    return base + self._launch_boost * LAUNCH_CEIL_FRAC * max(0.0, norm - base)
 
   def get_rise_rate(self) -> float:
-    return RISE_RATE[self._personality]
+    base = RISE_RATE[self._personality]
+    return base + self._launch_boost * max(0.0, STOCK_RISE_RATE - base)
 
   def get_decel_target(self, brake_need: float) -> float:
     return float(np.interp(max(0.0, float(brake_need)), SMOOTH_DECEL_BP, SMOOTH_DECEL_V[self._personality]))
@@ -139,12 +170,13 @@ class AccelController:
     return self._clean_accel(max(target_accel, self._last_target_accel - step))
 
   def _slew_up(self, target_accel: float) -> float:
+    rise_jerk = self._rise_jerk()
     if self._last_target_accel < 0.0:
       released = min(target_accel, self._last_target_accel + BRAKE_RELEASE_JERK * DT_MDL)
       if released <= 0.0:
         return self._clean_accel(released)
-      return self._clean_accel(min(target_accel, ACCEL_RISE_JERK[self._personality] * DT_MDL))
-    step = ACCEL_RISE_JERK[self._personality] * DT_MDL
+      return self._clean_accel(min(target_accel, rise_jerk * DT_MDL))
+    step = rise_jerk * DT_MDL
     return self._clean_accel(min(target_accel, self._last_target_accel + step))
 
   def _passthrough(self, target_accel: float) -> float:

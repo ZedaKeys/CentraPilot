@@ -14,7 +14,8 @@ from openpilot.sunnypilot.selfdrive.controls.lib.accel_personality.accel_control
 from openpilot.sunnypilot.selfdrive.controls.lib.accel_personality.constants import \
   ECO, NORMAL, SPORT, PERSONALITY_MIN, PERSONALITY_MAX, A_CRUISE_MAX_BP, RISE_RATE, \
   STOCK_A_CRUISE_MAX_V, STOCK_RISE_RATE, HARD_BRAKE_TARGET_ACCEL, AccelerationPersonality, \
-  LOWSPEED_COMFORT_CAP, LOWSPEED_CAP_MAX_V_EGO, LOWSPEED_CAP_SAFETY_BUFFER
+  LOWSPEED_COMFORT_CAP, LOWSPEED_CAP_MAX_V_EGO, LOWSPEED_CAP_SAFETY_BUFFER, \
+  A_CRUISE_MAX_V, LAUNCH_SUSTAIN_FRAMES, LAUNCH_VREL_FULL
 
 T_IDXS = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 4.0]
 _EPS = 1e-6
@@ -241,3 +242,75 @@ def test_lowspeed_cap_off_when_disabled():
   ctrl.update(make_sm(v_ego=7.0, lead=True, dRel=25.0, vRel=-4.0, aLeadK=-1.0))
   out = ctrl.smooth_target_accel(-1.9, flat_traj(-1.9), T_IDXS, should_stop=False)
   assert out == pytest.approx(-1.9, abs=_EPS)  # off == stock
+
+
+# --- lead launch boost ---
+
+def arm_launch(ctrl, v_ego=3.0, vRel=LAUNCH_VREL_FULL, aLeadK=1.5, frames=LAUNCH_SUSTAIN_FRAMES + 6):
+  for _ in range(frames):
+    ctrl.update(make_sm(v_ego=v_ego, lead=True, dRel=8.0, vRel=vRel, aLeadK=aLeadK))
+
+
+def test_launch_boost_lifts_eco_ceiling_toward_normal():
+  ctrl = make_controller(personality=ECO)
+  base = float(np.interp(3.0, A_CRUISE_MAX_BP, A_CRUISE_MAX_V[ECO]))
+  norm = float(np.interp(3.0, A_CRUISE_MAX_BP, STOCK_A_CRUISE_MAX_V))
+  arm_launch(ctrl)
+  boosted = ctrl.get_max_accel(3.0)
+  assert boosted > base + 1e-3        # lifted
+  assert boosted <= norm + 1e-6       # never above stock NORMAL ceiling
+  assert ctrl.get_rise_rate() > RISE_RATE[ECO]            # ceiling slew lifted
+  assert ctrl.get_rise_rate() <= STOCK_RISE_RATE + 1e-9   # capped at NORMAL
+
+
+def test_launch_boost_requires_sustain():
+  ctrl = make_controller(personality=ECO)
+  base = float(np.interp(3.0, A_CRUISE_MAX_BP, A_CRUISE_MAX_V[ECO]))
+  arm_launch(ctrl, frames=LAUNCH_SUSTAIN_FRAMES - 1)  # one short of the sustain
+  assert ctrl.get_max_accel(3.0) == pytest.approx(base, abs=_EPS)  # not yet armed -> no boost
+
+
+def test_launch_boost_needs_lead_accelerating():
+  ctrl = make_controller(personality=ECO)
+  base = float(np.interp(3.0, A_CRUISE_MAX_BP, A_CRUISE_MAX_V[ECO]))
+  arm_launch(ctrl, aLeadK=0.0)  # lead opening but NOT accelerating (coasting faster) -> no boost
+  assert ctrl.get_max_accel(3.0) == pytest.approx(base, abs=_EPS)
+
+
+def test_launch_boost_off_high_speed():
+  ctrl = make_controller(personality=ECO)
+  base = float(np.interp(12.0, A_CRUISE_MAX_BP, A_CRUISE_MAX_V[ECO]))
+  arm_launch(ctrl, v_ego=12.0)  # above the launch speed gate
+  assert ctrl.get_max_accel(12.0) == pytest.approx(base, abs=_EPS)
+
+
+def test_launch_boost_decays_when_lead_rematches():
+  ctrl = make_controller(personality=ECO)
+  arm_launch(ctrl)  # full boost
+  assert ctrl.get_max_accel(3.0) > float(np.interp(3.0, A_CRUISE_MAX_BP, A_CRUISE_MAX_V[ECO])) + 1e-3
+  # lead speed-matched: vRel below the arm floor -> boost releases
+  for _ in range(20):
+    ctrl.update(make_sm(v_ego=5.5, lead=True, dRel=8.0, vRel=0.2, aLeadK=0.0))
+  assert ctrl.get_max_accel(3.0) == pytest.approx(float(np.interp(3.0, A_CRUISE_MAX_BP, A_CRUISE_MAX_V[ECO])), abs=_EPS)
+
+
+def test_launch_boost_off_when_disabled_and_normal():
+  # disabled -> NORMAL, no boost
+  off = make_controller(enabled=False)
+  arm_launch(off)
+  assert off.get_max_accel(3.0) == pytest.approx(float(np.interp(3.0, A_CRUISE_MAX_BP, STOCK_A_CRUISE_MAX_V)), abs=_EPS)
+  # explicit NORMAL -> excluded from the boost (off==stock for normal)
+  nrm = make_controller(personality=NORMAL)
+  base_n = nrm.get_max_accel(3.0)
+  arm_launch(nrm)
+  assert nrm.get_max_accel(3.0) == pytest.approx(base_n, abs=_EPS)
+  assert nrm.get_rise_rate() == pytest.approx(STOCK_RISE_RATE, abs=_EPS)
+
+
+def test_launch_boost_does_not_touch_brake():
+  # the boost is ceiling/onset only; a brake demand is unaffected even while armed
+  ctrl = make_controller(personality=ECO)
+  arm_launch(ctrl)
+  ctrl.update(make_sm(v_ego=3.0, lead=True, dRel=8.0, vRel=LAUNCH_VREL_FULL, aLeadK=1.5))
+  out = ctrl.smooth_target_accel(-1.0, flat_traj(-1.0), T_IDXS, should_stop=False)
+  assert out <= -1.0 + _EPS  # brake never weakened by the launch boost
