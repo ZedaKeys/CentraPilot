@@ -106,7 +106,9 @@ class OpenpilotMetadata:
     return self.git_normalized_origin in ("github.com/sunnypilot/sunnypilot",
                                           "github.com/sunnypilot/openpilot",
                                           "github.com/sunnyhaibin/sunnypilot",
-                                          "github.com/sunnyhaibin/openpilot")
+                                          "github.com/sunnyhaibin/openpilot",
+                                          "github.com/ZedaKeys/CentraPilot",
+                                          "github.com/ZedaKeys/centrapilot")
 
   @property
   def git_normalized_origin(self) -> str:
